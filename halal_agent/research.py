@@ -1,14 +1,18 @@
 """Research agent: forms a directional thesis (BUY / HOLD / SELL) per asset.
 
 Two backends:
-  * `LLMResearchAgent` — uses OpenAI when an API key is configured. Feeds
-    technical snapshot + recent price action into a structured prompt and
-    parses a JSON response.
-  * `RuleBasedResearchAgent` — deterministic fallback. Uses RSI/MACD/EMA
-    crossover heuristics. Always available, no external dependency.
+  * :class:`RuleBasedResearchAgent` — deterministic, no external dependency.
+    Uses **multi-indicator confluence scoring** (RSI / EMA stack / MACD /
+    Bollinger Bands / candle patterns / volume confirmation). The bot only
+    proposes a high-confidence trade when several signals agree, instead of
+    firing on a single threshold.
+  * :class:`LLMResearchAgent` — uses OpenAI when an API key is configured.
+    Feeds the full snapshot (including candle patterns and band position)
+    into a structured prompt and parses a JSON response. Falls back to the
+    rule-based agent on any error.
 
 The research agent only *proposes* trades; the strategy + risk manager
-decide whether to act. This separation keeps the LLM out of the
+decide whether to act on them. This separation keeps the LLM out of the
 risk-control loop.
 """
 
@@ -26,6 +30,14 @@ logger = logging.getLogger(__name__)
 
 Action = Literal["BUY", "HOLD", "SELL"]
 
+# Score thresholds tuned for the rule-based agent. Buying needs more
+# conviction than selling because we are in a long-only spot strategy:
+# being wrong on entry burns capital and time, being slow on exit usually
+# only gives back a portion of unrealised profit.
+BUY_SCORE_THRESHOLD = 6
+SELL_SCORE_THRESHOLD = 5
+MAX_SCORE = 12  # used to normalise score → confidence
+
 
 @dataclass
 class Thesis:
@@ -39,43 +51,170 @@ class ResearchAgent(Protocol):
     async def evaluate(self, snapshot: TechnicalSnapshot) -> Thesis: ...
 
 
-class RuleBasedResearchAgent:
-    """Deterministic, dependency-free research heuristic.
+# ---------------------------------------------------------------------------
+# Rule-based agent — confluence scoring.
+# ---------------------------------------------------------------------------
 
-    Logic:
-      * BUY  if oversold (RSI<30) AND uptrend (EMA20>EMA50) AND MACD>signal
-      * SELL if overbought (RSI>70) OR (EMA20<EMA50 AND MACD<signal)
-      * HOLD otherwise
-    Confidence scales with how decisively the conditions are met.
+
+def _score_buy(s: TechnicalSnapshot) -> tuple[int, list[str]]:
+    """Return (score, reasons) for a hypothetical BUY at this snapshot."""
+    score = 0
+    reasons: list[str] = []
+
+    # Momentum
+    if s.oversold:
+        score += 2
+        reasons.append(f"RSI={s.rsi_14:.0f} oversold")
+    elif s.rsi_14 < 45:
+        score += 1
+        reasons.append(f"RSI={s.rsi_14:.0f} weak/lower-half")
+
+    # Mean reversion (Bollinger lower band)
+    if s.near_lower_band:
+        score += 2
+        reasons.append("near lower BB")
+
+    # Trend alignment
+    if s.trend_up:
+        score += 2
+        reasons.append("EMA stack bullish (9>21>50)")
+    elif s.ema_21 > s.ema_50:
+        score += 1
+        reasons.append("medium-term uptrend (EMA21>EMA50)")
+
+    # MACD
+    if s.macd_bull_cross:
+        score += 2
+        reasons.append("MACD bullish cross (recent)")
+    elif s.macd_hist > 0:
+        score += 1
+        reasons.append("MACD positive")
+
+    # Candle reversal
+    if s.bullish_reversal_candle:
+        score += 2
+        reasons.append("bullish reversal candle")
+
+    # Volume confirmation (only awarded if at least one other signal fired)
+    if s.high_volume and score > 0:
+        score += 1
+        reasons.append(f"volume spike (z={s.volume_z:.1f})")
+
+    return score, reasons
+
+
+def _score_sell(s: TechnicalSnapshot) -> tuple[int, list[str]]:
+    """Return (score, reasons) for a hypothetical SELL/exit at this snapshot."""
+    score = 0
+    reasons: list[str] = []
+
+    # Momentum
+    if s.overbought:
+        score += 2
+        reasons.append(f"RSI={s.rsi_14:.0f} overbought")
+    elif s.rsi_14 > 60:
+        score += 1
+        reasons.append(f"RSI={s.rsi_14:.0f} elevated")
+
+    # Mean reversion (Bollinger upper band)
+    if s.near_upper_band:
+        score += 2
+        reasons.append("near upper BB")
+
+    # Trend breakdown
+    if s.trend_down:
+        score += 2
+        reasons.append("EMA stack bearish (9<21<50)")
+    elif s.ema_21 < s.ema_50:
+        score += 1
+        reasons.append("medium-term downtrend (EMA21<EMA50)")
+
+    # MACD
+    if s.macd_bear_cross:
+        score += 2
+        reasons.append("MACD bearish cross (recent)")
+    elif s.macd_hist < 0:
+        score += 1
+        reasons.append("MACD negative")
+
+    # Candle reversal
+    if s.bearish_reversal_candle:
+        score += 2
+        reasons.append("bearish reversal candle")
+
+    if s.high_volume and score > 0:
+        score += 1
+        reasons.append(f"volume spike (z={s.volume_z:.1f})")
+
+    return score, reasons
+
+
+class RuleBasedResearchAgent:
+    """Deterministic confluence-scoring research heuristic.
+
+    For each snapshot we compute a *buy score* and a *sell score* by summing
+    independent signal weights (see :func:`_score_buy` / :func:`_score_sell`).
+    The action with the higher score is preferred, but only emitted if it
+    clears its threshold.
+
+    Confidence is the score normalised by :data:`MAX_SCORE` so it lives in
+    ``[0, 1]`` and can be compared across pairs and used by the risk manager
+    to scale the position size.
     """
 
     async def evaluate(self, snapshot: TechnicalSnapshot) -> Thesis:
         s = snapshot
-        macd_bull = s.macd > s.macd_signal
-        macd_bear = s.macd < s.macd_signal
+        buy_score, buy_reasons = _score_buy(s)
+        sell_score, sell_reasons = _score_sell(s)
 
-        if s.oversold and s.trend_up and macd_bull:
-            confidence = min(1.0, (30 - s.rsi_14) / 30 + 0.5)
+        if buy_score >= BUY_SCORE_THRESHOLD and buy_score >= sell_score:
             return Thesis(
                 s.symbol,
                 "BUY",
-                confidence,
-                f"RSI={s.rsi_14:.1f} oversold; EMA20>EMA50; MACD bullish.",
+                min(1.0, buy_score / MAX_SCORE),
+                f"BUY (score={buy_score}): " + "; ".join(buy_reasons),
             )
-        if s.overbought or (not s.trend_up and macd_bear):
-            confidence = 0.6 if s.overbought else 0.5
+        if sell_score >= SELL_SCORE_THRESHOLD and sell_score > buy_score:
             return Thesis(
                 s.symbol,
                 "SELL",
-                confidence,
-                f"RSI={s.rsi_14:.1f}; trend_up={s.trend_up}; MACD bearish.",
+                min(1.0, sell_score / MAX_SCORE),
+                f"SELL (score={sell_score}): " + "; ".join(sell_reasons),
             )
+        # Insufficient confluence — emit HOLD so the agent falls back to its
+        # deterministic % stop-loss / take-profit safety net for any held
+        # position.
         return Thesis(
             s.symbol,
             "HOLD",
             0.3,
-            f"No clear signal (RSI={s.rsi_14:.1f}, trend_up={s.trend_up}).",
+            (
+                f"HOLD (buy={buy_score}<{BUY_SCORE_THRESHOLD}, "
+                f"sell={sell_score}<{SELL_SCORE_THRESHOLD}, RSI={s.rsi_14:.0f})"
+            ),
         )
+
+
+# ---------------------------------------------------------------------------
+# LLM-backed agent.
+# ---------------------------------------------------------------------------
+
+
+_LLM_SYSTEM_PROMPT = (
+    "You are a conservative crypto trading analyst. You read a technical "
+    "snapshot (price, RSI, EMA stack, MACD, Bollinger band position, ATR, "
+    "volume z-score, and candle pattern flags) and emit a directional "
+    "thesis as a JSON object.\n\n"
+    "Rules:\n"
+    "  - Output keys: action ('BUY'|'HOLD'|'SELL'), confidence (0..1), "
+    "rationale (one sentence).\n"
+    "  - Prefer HOLD when signals conflict.\n"
+    "  - BUY only when momentum, trend, and at least one confirmation "
+    "(candle pattern or volume spike) align.\n"
+    "  - SELL when there is a clear bearish confluence — overbought + "
+    "bearish reversal candle, MACD bearish cross with downtrend, etc.\n"
+    "  - Never use leverage, margin, futures, or options. Spot only.\n"
+)
 
 
 class LLMResearchAgent:
@@ -104,17 +243,17 @@ class LLMResearchAgent:
 
     async def _call_llm(self, snapshot: TechnicalSnapshot) -> Thesis:
         prompt = (
-            "You are a conservative crypto trading analyst. Given the technical "
-            "snapshot below, output a JSON object with keys "
-            '"action" (one of "BUY","HOLD","SELL"), '
-            '"confidence" (0..1), and "rationale" (one sentence).\n\n'
-            "Be conservative — prefer HOLD over BUY/SELL when signals conflict.\n\n"
-            f"Snapshot: {json.dumps(asdict(snapshot))}\n"
+            "Analyse the following snapshot and emit a JSON object as "
+            "specified.\n\n"
+            f"Snapshot: {json.dumps(asdict(snapshot))}"
         )
         assert self._client is not None
         resp = await self._client.chat.completions.create(
             model=self.settings.openai_model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
             response_format={"type": "json_object"},
             temperature=0.2,
         )

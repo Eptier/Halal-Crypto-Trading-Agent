@@ -113,7 +113,7 @@ class Agent:
         state: PortfolioState,
         prices: dict[str, float],
     ) -> FillReport | None:
-        # Exit logic: if we hold this pair, check stop-loss / take-profit first.
+        # Resolve current holding (if any).
         holding: Position | None = None
         if isinstance(self.executor, PaperExecutor):
             holding = self.executor.positions.get(pair)
@@ -127,23 +127,48 @@ class Agent:
                     )
                     break
 
-        if holding is not None:
-            should_exit, reason = self.risk.should_exit(holding.avg_entry_price, snap.last_price)
-            if should_exit:
-                logger.info("Exiting %s: %s", pair, reason)
-                return await self.executor.sell(pair, holding.base_amount, snap.last_price)
-
-        # Entry logic: evaluate research thesis.
+        # Always evaluate the research thesis. The same multi-indicator
+        # confluence scoring drives BOTH entry (BUY when no position) and
+        # exit (SELL when holding).
         thesis = await self.researcher.evaluate(snap)
         logger.info(
             "%s: action=%s confidence=%.2f rationale=%s",
             pair, thesis.action, thesis.confidence, thesis.rationale,
         )
 
+        if holding is not None:
+            # ---- Exit logic ------------------------------------------------
+            #
+            # Priority 1 (smart): research-driven SELL — only when the
+            # confluence score is strong enough to be confident the move is
+            # over (e.g. overbought + bearish reversal candle + MACD bearish
+            # cross + EMA stack breaking down). This is the user-requested
+            # "use indicators to decide when to sell".
+            #
+            # Priority 2 (safety net): fixed-percentage stop-loss /
+            # take-profit. Fires only when the indicators DON'T paint a clear
+            # picture but price has moved decisively against us (or far in our
+            # favour). This is the user-requested "if the situation can't be
+            # read, fall back to %".
+            if thesis.action == "SELL" and thesis.confidence >= 0.4:
+                logger.info(
+                    "Exit %s on research SELL (conf=%.2f): %s",
+                    pair, thesis.confidence, thesis.rationale,
+                )
+                return await self.executor.sell(pair, holding.base_amount, snap.last_price)
+
+            should_exit, reason = self.risk.should_exit(
+                holding.avg_entry_price, snap.last_price
+            )
+            if should_exit:
+                logger.info("Exit %s on %% safety net: %s", pair, reason)
+                return await self.executor.sell(pair, holding.base_amount, snap.last_price)
+
+            return None  # hold — don't pyramid into an existing position
+
+        # ---- Entry logic ----------------------------------------------------
         if thesis.action != "BUY":
             return None
-        if holding is not None:
-            return None  # don't pyramid — one position per asset
         try:
             quote_amount = self.risk.size_buy(state, snap.last_price, thesis.confidence)
         except RiskRefusal as exc:
