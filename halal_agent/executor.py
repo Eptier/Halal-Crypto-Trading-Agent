@@ -145,6 +145,27 @@ class LiveExecutor(Executor):
         filled_quote = float(order.get("cost") or quote_amount)
         price = float(order.get("average") or order.get("price") or last_price)
         report = FillReport(pair, "buy", filled_base, filled_quote, price, is_paper=False)
+
+        # Persist the position so the agent can enforce stop-loss / take-profit /
+        # max-open-positions on the next tick. Without this, the live agent would
+        # be unable to detect existing holdings and would re-buy every cycle.
+        if filled_base > 0:
+            existing = await self.ledger.get_position(pair)
+            if existing is not None:
+                existing_base, existing_avg = existing
+                new_base = existing_base + filled_base
+                new_avg = (
+                    (existing_base * existing_avg + filled_base * price) / new_base
+                    if new_base > 0
+                    else price
+                )
+            else:
+                new_base = filled_base
+                new_avg = price
+            await self.ledger.upsert_position(pair, new_base, new_avg)
+        else:
+            logger.warning("Live buy on %s returned filled_base=0; position not recorded", pair)
+
         await self._log(report, rationale="live-buy")
         return report
 
@@ -155,6 +176,21 @@ class LiveExecutor(Executor):
         filled_quote = float(order.get("cost") or filled_base * last_price)
         price = float(order.get("average") or order.get("price") or last_price)
         report = FillReport(pair, "sell", filled_base, filled_quote, price, is_paper=False)
+
+        # Update / clear the persisted position so subsequent ticks reflect reality.
+        existing = await self.ledger.get_position(pair)
+        if existing is not None:
+            existing_base, existing_avg = existing
+            remaining = existing_base - filled_base
+            if remaining <= 1e-12:
+                await self.ledger.delete_position(pair)
+            else:
+                await self.ledger.upsert_position(pair, remaining, existing_avg)
+        else:
+            logger.warning(
+                "Live sell on %s but no recorded position; nothing to update", pair
+            )
+
         await self._log(report, rationale="live-sell")
         return report
 

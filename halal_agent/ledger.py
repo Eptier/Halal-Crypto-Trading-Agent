@@ -103,6 +103,18 @@ class Ledger:
             rows = await cur.fetchall()
             return [(str(r[0]), float(r[1]), float(r[2]), str(r[3])) for r in rows]
 
+    async def get_position(self, pair: str) -> tuple[float, float] | None:
+        """Return (base_amount, avg_entry_price) for the pair, or None if absent."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT base_amount,avg_entry_price FROM positions WHERE pair=?",
+                (pair,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return float(row[0]), float(row[1])
+
     async def record_equity(self, equity: float) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
