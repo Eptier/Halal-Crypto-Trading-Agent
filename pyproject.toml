@@ -1,0 +1,41 @@
+[project]
+name = "crypto-mining-tool"
+version = "1.0.0"
+description = "CPU-based Crypto Mining Tool with Dashboard - Normal PC তে চলবে"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Eptier", email = "khaneptier@gmail.com"}
+]
+dependencies = [
+    "psutil>=5.9.0",
+    "requests>=2.28.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+    "flask>=3.0.0",
+    "apscheduler>=3.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+crypto-miner = "mining_tool.main:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"mining_tool/dashboard/web_dashboard.py" = ["E501"]
